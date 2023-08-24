@@ -1,0 +1,654 @@
+---
+title: "To impute, or not to impute, that is the question"
+subtitle: "SDS final project - Part 2"
+author: "Christian Buda"
+date: '2023-07-28'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r load packages, message=FALSE, warning=FALSE, echo = FALSE}
+require(mvtnorm)
+require(MCMCpack)
+library(progress)
+library(future)
+library(future.apply)
+require(LaplacesDemon)
+require(asbio)
+require(dplyr)
+require(krige)
+library(ggplot2)
+library(ggcorrplot)
+library(R2jags)
+library(ggmcmc)
+library(mcmcse)
+require(latex2exp)
+```
+
+```{r get colors, echo=FALSE}
+
+##### here we make some colors for later #####
+
+
+somecolornames = c('chocolate1', 'aquamarine1', 'chartreuse1', 'cornflowerblue', 'coral1', 'cyan1', 'brown1', 'darkgoldenrod1', 'darkolivegreen1', 'dodgerblue3', 'goldenrod1', 'indianred1', 'khaki', 'magenta1', 'olivedrab1', 'orangered', 'royalblue1', 'seagreen1', 'salmon', 'tomato', 'springgreen', 'steelblue', 'tan2', 'slateblue1', 'plum1')
+
+
+transparent_color <- function(color, alpha = 0.4) {
+
+  rgb_col <- col2rgb(color)/255
+
+  col <- rgb(rgb_col[1], rgb_col[2], rgb_col[3], alpha = alpha)
+
+  return(col)
+}
+
+somecolors = list()
+
+for( i in 1:length(somecolornames)) {
+  somecolors = append(somecolors, list(transparent_color(somecolornames[i], alpha = 0.4)))
+}
+
+
+```
+
+```{r, echo = FALSE}
+# all data
+data = read.csv('194903-202010_Bottle.csv', sep = ",")
+
+# only some columns
+interesting_cols = c(5,6,8,9,10)
+data = data[interesting_cols]
+
+
+```
+
+```{r subsample dataset, echo = FALSE}
+# remove NA
+data = data[!apply(is.na(data), 1, any),]
+
+set.seed(42)
+
+# subsample dataset
+n = 10000
+data_idx = sample(dim(data)[1], size = n)
+data = data[data_idx,]
+
+# reorder data according to depth
+data = data[order(data$Depthm),]
+
+```
+
+
+```{r pairplot, fig.width = 11, fig.height = 10, echo = FALSE}
+
+panel.hist <- function(x, ...) {
+  usr <- par("usr")
+  par(usr = c(usr[1:2], 0, 1.5) )
+  h <- hist(x, plot = FALSE)
+  breaks <- h$breaks; nB <- length(breaks)
+  y <- h$counts; y <- y/max(y)
+  col = sample(25,1)
+  rect(breaks[-nB], 0, breaks[-1], y, col = somecolors[[col]], border = somecolors[[col]])
+}
+
+panel.cor <- function(x, y) {
+  usr <- par("usr")
+  col = floor(10*sum(x+y))%%25 + 1
+  points(x, y, col = somecolors[[col]], pch = 20)
+}
+
+```
+
+```{r, echo = FALSE}
+
+# all data
+mask = read.csv('194903-202010_Bottle.csv', sep = ",")
+
+# only some columns
+interesting_cols = c(5,6,8,9,10)
+mask = mask[interesting_cols]
+
+
+set.seed(420)
+mask = mask[sample(dim(data)[1], size = n),]
+mask = is.na(mask)
+
+
+# set a maximum of 3 NA per row
+mask[apply(mask, 1, sum)==4,] = rep(F, 5)
+
+
+```
+
+
+```{r, echo = FALSE}
+# rescale data
+scaled_scale = scale(data)
+data = scaled_scale
+scaled_center = attr(scaled_scale, 'scaled:center')
+scaled_scale = attr(scaled_scale, 'scaled:scale')
+
+# create masked_data
+masked_data = data
+masked_data[mask] = NA
+
+```
+
+## Model 5: Fusion!
+
+Following the line of the last model, let's fit a simpler model with approximate fixed parameters. The model I chose is:
+$$
+\frac{A}{x+1} + C
+$$
+The main advantage is that it has a vertical asymptote, so it seems to suit well this data, and it only has two parameters, so it's much easier to tune. I used this model for all the 4 columns, since the previous oxygen model was not invertible. This is how the handtuned curve looks like:
+
+```{r, fig.width = 8, fig.height = 8, echo = FALSE}
+
+par(mfrow = c(2,2))
+
+plot(masked_data[,1], masked_data[,2], col = somecolors[[2]], pch = 20, ylab = '', main = colnames(masked_data)[2], xlab = 'Depth')
+lines(data[,1], 2/(data[,1] + 1) + min(data[,2]) - 2/10, col = somecolornames[[3]], lwd = 2)
+
+plot(masked_data[,1], masked_data[,3], col = somecolors[[3]], pch = 20, ylab = '', main = colnames(masked_data)[3], xlab = 'Depth')
+lines(data[,1], 2/(data[,1] + 1) + min(data[,3]) - 2/10, col = somecolornames[[4]], lwd = 2)
+
+plot(masked_data[,1], masked_data[,4], col = somecolors[[4]], pch = 20, ylab = '', main = colnames(masked_data)[4], xlab = 'Depth')
+lines(data[,1], -2/(data[,1] + 1) + max(data[,4]) + 2/10, col = somecolornames[[5]], lwd = 2)
+
+plot(masked_data[,1], masked_data[,5], col = somecolors[[5]], pch = 20, ylab = '', main = colnames(masked_data)[5], xlab = 'Depth')
+lines(data[,1], 2/(data[,1] + 1) + min(data[,5]) - 2/10, col = somecolornames[[6]], lwd = 2)
+
+
+
+par(mfrow = c(1,1))
+
+
+```
+
+Using this functional forms, I transformed the data to linearize the features, this is the final pairplot:
+```{r, echo = FALSE, fig.height=10, fig.width=11}
+
+X.full.normregOR = masked_data
+
+X.full.normregOR[,2] = 2/(X.full.normregOR[,2] + 2/10 - min(X.full.normregOR[,2], na.rm = T)) - 1
+X.full.normregOR[,3] = 2/(X.full.normregOR[,3] + 2/10 - min(X.full.normregOR[,3], na.rm = T)) - 1
+X.full.normregOR[,4] = -2/(X.full.normregOR[,4] - 2/10 - max(X.full.normregOR[,4], na.rm = T)) - 1
+X.full.normregOR[,5] = 2/(X.full.normregOR[,5] + 2/10 - min(X.full.normregOR[,5], na.rm = T)) - 1
+
+
+scaled_scale_normregOR = scale(X.full.normregOR)
+X.full.normregOR = data.frame(scaled_scale_normregOR)
+scaled_center_normregOR = attr(scaled_scale_normregOR, 'scaled:center')
+scaled_scale_normregOR = attr(scaled_scale_normregOR, 'scaled:scale')
+
+
+pairs(X.full.normregOR[apply(!is.na(X.full.normregOR), 1, all),], panel = panel.cor, diag.panel = panel.hist, main = "Full dataset")
+
+```
+
+It looks a bit better, but many correlations are still heavily nonlinear. Let's run the multivariate normal strategy on this new dataset.
+
+```{r, echo = FALSE}
+set.seed(420)
+plan(multisession, workers = 8)
+
+
+X.full.normreg = X.full.normregOR
+
+
+# initialization of output
+M = 1000
+n_chains = 3
+burnin = 200
+THETA.rnormreg = array(0, dim = c(M-burnin, n_chains, dim(X.full.normreg)[2]))
+SIGMA.rnormreg = array(0, dim = c(M-burnin, n_chains, dim(X.full.normreg)[2]**2))
+X.MISS.rnormreg = array(0, dim = c(M-burnin, n_chains, sum(is.na(X.full.normreg))))
+
+
+### prior parameters
+n = dim(X.full.normreg)[1]
+p = dim(X.full.normreg)[2]
+
+mu0 = rnorm(p, 0, 1)
+sd0 = rgamma(p,3) + 1/10
+
+# 0 prior correlation
+L0 = matrix (0, p, p)
+diag(L0) = 1
+L0 = L0 * outer(sd0,sd0)
+nu0 = p+2
+S0 = L0
+invL0 = solve(L0)
+
+
+### starting values
+Sigma = S0
+X.full = as.matrix(X.full.normreg)
+O = 1*(!is.na(X.full))
+
+# starting missing values are just column means
+for(j in 1:p) {
+  X.full[is.na(X.full[,j]), j] = mean(X.full[, j], na.rm=TRUE)
+}
+
+
+
+populate_missing = function(x, o, theta, Sigma) {
+  b = ( o==0 )
+  a = ( o==1 )
+  
+  if(all(a)) {
+    return(x)
+  }
+  iSa = solve( Sigma[a, a] )
+  beta.j = Sigma[b,a]%*%iSa
+  Sigma.j = Sigma[b,b] - Sigma[b,a]%*%iSa%*%Sigma[a,b]
+  theta.j = theta[b] + beta.j%*%t(t(x[a]) - theta[a])
+  x[b] = rmvnorm(1, theta.j, Sigma.j)
+  
+  return(x)
+}
+
+
+
+pb = progress_bar$new(total = M)
+
+### Gibbs sampler
+THETA = matrix(nrow = M, ncol = dim(X.full.normreg)[2])
+SIGMA = matrix(nrow = M, ncol = dim(X.full.normreg)[2]**2)
+X.MISS = matrix(nrow = M, ncol = sum(is.na(X.full.normreg)))
+
+for(s in 1:M) {
+  
+  ###update theta
+  Xbar = apply(X.full, 2, mean)
+  
+  invSigma = solve(Sigma)
+  
+  Ln = solve(invL0 + n * invSigma)
+  mun = Ln%*%( invL0%*%mu0 + n*invSigma%*%Xbar )
+  
+  theta = rmvnorm(1,mun,Ln)
+  
+  ###
+  ###update Sigma
+  
+  Sn = S0 + ( t(X.full)-c(theta) )%*%t(t(X.full)-c(theta))
+  Sigma = solve(rwish(nu0+n,solve(Sn)))
+  
+  ###
+  ###update missing data
+  X.full = t(future_mapply(populate_missing, split(X.full, row(X.full)), split(O, row(O)), MoreArgs = list(theta = theta, Sigma = Sigma), future.seed=TRUE))
+  
+  ### save results
+  
+  THETA[s,] = theta
+  SIGMA[s,] = c(Sigma)
+  X.MISS[s,] = X.full[O==0]
+  
+  pb$tick()
+  ###
+}
+###
+
+
+X.MISS.rnormreg[,1,] = X.MISS[(burnin+1):M,]
+THETA.rnormreg[,1,] = THETA[(burnin+1):M,]
+SIGMA.rnormreg[,1,] = SIGMA[(burnin+1):M,]
+
+```
+
+```{r, echo = FALSE}
+
+X.full.normreg = X.full.normregOR
+
+mu0 = rnorm(p, 0, 1)
+sd0 = rgamma(p,3) + 1/10
+
+# 0 prior correlation
+L0 = matrix (0, p, p)
+diag(L0) = 1
+L0 = L0 * outer(sd0,sd0)
+
+
+### prior parameters
+n = dim(X.full.normreg)[1]
+p = dim(X.full.normreg)[2]
+nu0 = p+2
+S0 = L0
+invL0 = solve(L0)
+
+
+### starting values
+Sigma = S0
+X.full = as.matrix(X.full.normreg)
+O = 1*(!is.na(X.full))
+
+# starting missing values are just column means
+for(j in 1:p) {
+  X.full[is.na(X.full[,j]), j] = mean(X.full[, j], na.rm=TRUE)
+}
+
+
+
+populate_missing = function(x, o, theta, Sigma) {
+  b = ( o==0 )
+  a = ( o==1 )
+  
+  if(all(a)) {
+    return(x)
+  }
+  iSa = solve( Sigma[a, a] )
+  beta.j = Sigma[b,a]%*%iSa
+  Sigma.j = Sigma[b,b] - Sigma[b,a]%*%iSa%*%Sigma[a,b]
+  theta.j = theta[b] + beta.j%*%t(t(x[a]) - theta[a])
+  x[b] = rmvnorm(1, theta.j, Sigma.j)
+  
+  return(x)
+}
+
+
+
+pb = progress_bar$new(total = M)
+
+### Gibbs sampler
+THETA = matrix(nrow = M, ncol = dim(X.full.normreg)[2])
+SIGMA = matrix(nrow = M, ncol = dim(X.full.normreg)[2]**2)
+X.MISS = matrix(nrow = M, ncol = sum(is.na(X.full.normreg)))
+
+for(s in 1:M) {
+  
+  ###update theta
+  Xbar = apply(X.full, 2, mean)
+  
+  invSigma = solve(Sigma)
+  
+  Ln = solve(invL0 + n * invSigma)
+  mun = Ln%*%( invL0%*%mu0 + n*invSigma%*%Xbar )
+  
+  theta = rmvnorm(1,mun,Ln)
+  
+  ###
+  ###update Sigma
+  
+  Sn = S0 + ( t(X.full)-c(theta) )%*%t(t(X.full)-c(theta))
+  Sigma = solve(rwish(nu0+n,solve(Sn)))
+  
+  ###
+  ###update missing data
+  X.full = t(future_mapply(populate_missing, split(X.full, row(X.full)), split(O, row(O)), MoreArgs = list(theta = theta, Sigma = Sigma), future.seed=TRUE))
+  
+  ### save results
+  
+  THETA[s,] = theta
+  SIGMA[s,] = c(Sigma)
+  X.MISS[s,] = X.full[O==0]
+  
+  pb$tick()
+  ###
+}
+###
+
+
+
+X.MISS.rnormreg[,2,] = X.MISS[(burnin+1):M,]
+THETA.rnormreg[,2,] = THETA[(burnin+1):M,]
+SIGMA.rnormreg[,2,] = SIGMA[(burnin+1):M,]
+
+```
+
+
+
+```{r, echo = FALSE}
+
+X.full.normreg = X.full.normregOR
+
+mu0 = rnorm(p, 0, 1)
+sd0 = rgamma(p,3) + 1/10
+
+# 0 prior correlation
+L0 = matrix (0, p, p)
+diag(L0) = 1
+L0 = L0 * outer(sd0,sd0)
+
+
+### prior parameters
+n = dim(X.full.normreg)[1]
+p = dim(X.full.normreg)[2]
+nu0 = p+2
+S0 = L0
+invL0 = solve(L0)
+
+
+### starting values
+Sigma = S0
+X.full = as.matrix(X.full.normreg)
+O = 1*(!is.na(X.full))
+
+# starting missing values are just column means
+for(j in 1:p) {
+  X.full[is.na(X.full[,j]), j] = mean(X.full[, j], na.rm=TRUE)
+}
+
+
+
+populate_missing = function(x, o, theta, Sigma) {
+  b = ( o==0 )
+  a = ( o==1 )
+  
+  if(all(a)) {
+    return(x)
+  }
+  iSa = solve( Sigma[a, a] )
+  beta.j = Sigma[b,a]%*%iSa
+  Sigma.j = Sigma[b,b] - Sigma[b,a]%*%iSa%*%Sigma[a,b]
+  theta.j = theta[b] + beta.j%*%t(t(x[a]) - theta[a])
+  x[b] = rmvnorm(1, theta.j, Sigma.j)
+  
+  return(x)
+}
+
+
+
+pb = progress_bar$new(total = M)
+
+### Gibbs sampler
+THETA = matrix(nrow = M, ncol = dim(X.full.normreg)[2])
+SIGMA = matrix(nrow = M, ncol = dim(X.full.normreg)[2]**2)
+X.MISS = matrix(nrow = M, ncol = sum(is.na(X.full.normreg)))
+
+for(s in 1:M) {
+  
+  ###update theta
+  Xbar = apply(X.full, 2, mean)
+  
+  invSigma = solve(Sigma)
+  
+  Ln = solve(invL0 + n * invSigma)
+  mun = Ln%*%( invL0%*%mu0 + n*invSigma%*%Xbar )
+  
+  theta = rmvnorm(1,mun,Ln)
+  
+  ###
+  ###update Sigma
+  
+  Sn = S0 + ( t(X.full)-c(theta) )%*%t(t(X.full)-c(theta))
+  Sigma = solve(rwish(nu0+n,solve(Sn)))
+  
+  ###
+  ###update missing data
+  X.full = t(future_mapply(populate_missing, split(X.full, row(X.full)), split(O, row(O)), MoreArgs = list(theta = theta, Sigma = Sigma), future.seed=TRUE))
+  
+  ### save results
+  
+  THETA[s,] = theta
+  SIGMA[s,] = c(Sigma)
+  X.MISS[s,] = X.full[O==0]
+  
+  pb$tick()
+  ###
+}
+###
+
+
+
+X.MISS.rnormreg[,3,] = X.MISS[(burnin+1):M,]
+THETA.rnormreg[,3,] = THETA[(burnin+1):M,]
+SIGMA.rnormreg[,3,] = SIGMA[(burnin+1):M,]
+
+
+```
+
+
+### Convergence diagnostics
+Here you can see the distribution of the potential scale reduction factor for the 3 set of parameters:
+
+```{r, fig.width = 9, fig.height = 4, echo = FALSE}
+manual_gelman = function(X) {
+  L = dim(X)[1]
+  n_chains = dim(X)[2]
+  x_c = apply(X, 3, colMeans)
+  x = colMeans(x_c)
+  B = L * colSums((x_c-x)**2)/(n_chains-1)
+  W = colSums((apply(X, 3, as.vector) - x)**2) / (n_chains*(L-1))
+  return((B*(1+1/n_chains) + (L-1)*W)/(L*W))
+}
+
+gelman = function(X) {
+  return(apply(X, 3, function(x) R.hat(x, burn.in = 0)))
+}
+
+
+compute_PSRF = function(THETA, SIGMA, X.MISS) {
+  par(mfrow = c(1,3))
+  hist(gelman(THETA), xlab = 'PSRF', main = 'THETA', probability = FALSE, col = somecolors[[6]], border = somecolornames[6])
+  hist(gelman(SIGMA), xlab = 'PSRF', main = 'SIGMA', probability = FALSE, col = somecolors[[8]], border = somecolornames[8])
+  hist(gelman(X.MISS), xlab = 'PSRF', main = 'X.MISS', probability = FALSE, col = somecolors[[13]], border = somecolornames[13])
+  par(mfrow = c(1,1))
+}
+
+
+compute_PSRF(THETA.rnormreg, SIGMA.rnormreg, X.MISS.rnormreg)
+```
+
+And here you can see the distribution of the geweke statistic for each chain in each set of parameters:
+
+```{r, fig.width = 11, fig.height = 11, echo = FALSE}
+
+geweke = function(X) {
+  return(apply(X, 2, function(x) apply(x, 2, function(x) krige::geweke(as.matrix(x)))[1,]))
+}
+
+
+compute_geweke = function(THETA, SIGMA, X.MISS) {
+  par(mfrow = c(3,3))
+  
+  THETA = geweke(THETA)
+  SIGMA = geweke(SIGMA)
+  X.MISS = geweke(X.MISS)
+  
+  for(i in 1:3) {
+    hist(THETA[,i], xlab = 'Geweke statistic', main = 'THETA', probability = F, col = somecolors[[5]], border = somecolornames[5])
+    
+    hist(SIGMA[,i], xlab = 'Geweke statistic', main = 'SIGMA', probability = F, col = somecolors[[8]], border = somecolornames[8])
+    
+    h = hist(X.MISS[,i], xlab = 'Geweke statistic', main = 'X.MISS', probability = T, col = somecolors[[21]], border = somecolornames[21], ylim = c(0,dnorm(0)))
+    curve(dnorm(x), from = h$breaks[1], to = h$breaks[length(h$breaks)], add = T, lwd = 2, col = somecolornames[14])
+    
+  }
+  
+  par(mfrow = c(1,1))
+}
+
+
+compute_geweke(THETA.rnormreg, SIGMA.rnormreg, X.MISS.rnormreg)
+
+```
+There does not seem to be any indication of something not converging.
+
+
+### Performance evaluation
+
+We now want to infer the final imputed values to compare them to the other models. To compute these values we use the average of the values extracted for each of the missing points.
+
+```{r, fig.width = 11, fig.height = 10, echo = FALSE}
+
+X.full.normreg = X.full.normregOR
+X.full.normreg[is.na(X.full.normregOR)] =  apply(X.MISS.rnormreg, 3, mean)
+colnames(X.full.normreg) = colnames(masked_data)
+
+X.full.normreg = X.full.normreg*scaled_scale_normregOR + scaled_center_normregOR
+
+X.full.normreg[,2] = 2/(X.full.normreg[,2] + 1) + min(masked_data[,2], na.rm = T) - 2/10
+X.full.normreg[,3] = 2/(X.full.normreg[,3] + 1) + min(masked_data[,3], na.rm = T) - 2/10
+X.full.normreg[,4] = -2/(X.full.normreg[,4] + 1) + max(masked_data[,4], na.rm = T) + 2/10
+X.full.normreg[,5] = 2/(X.full.normreg[,5] + 1) + min(masked_data[,5], na.rm = T) - 2/10
+
+
+
+pairs(X.full.normreg, panel = panel.cor, diag.panel = panel.hist, main = "Model 5")
+
+```
+
+Oddly, many outliers were imputed, so the results are just inadequate. Let's try to replace the outliers hoping for the best.
+
+```{r, fig.width = 11, fig.height = 10, echo = FALSE}
+out <- boxplot.stats(X.full.normreg[,2])$out
+out_ind <- which(X.full.normreg[,2] %in% c(out))
+X.full.normreg[out_ind,2] = mean(X.full.normreg[,2])
+
+out <- boxplot.stats(X.full.normreg[,3])$out
+out_ind <- which(X.full.normreg[,3] %in% c(out))
+X.full.normreg[out_ind,3] = mean(X.full.normreg[,3])
+
+out <- boxplot.stats(X.full.normreg[,4])$out
+out_ind <- which(X.full.normreg[,4] %in% c(out))
+X.full.normreg[out_ind,4] = mean(X.full.normreg[,4])
+
+out <- boxplot.stats(X.full.normreg[,5])$out
+out_ind <- which(X.full.normreg[,5] %in% c(out))
+X.full.normreg[out_ind,5] = mean(X.full.normreg[,5])
+
+pairs(X.full.normreg, panel = panel.cor, diag.panel = panel.hist, main = "Model 5")
+```
+
+It's still pretty bad.
+
+Let's see how it performs with respect to the "true" masked values.
+
+```{r, fig.width = 6, fig.height = 4, echo = FALSE}
+
+compute_MSE = function(x) {
+  cat('MSE of the imputed data wrt the correct ones:\n')
+  res = sqrt(colSums((x[,-1] - data[,-1])**2)/colSums(is.na(masked_data[,-1])))
+  
+  res2 = c(sqrt(sum((x - data)**2)/sum(is.na(masked_data))), res)
+  names(res2) = c('Overall', names(res))
+  
+  res2
+}
+
+absolute_deviation_distro = function(X) {
+  
+  par(mfrow = c(2,2))
+  
+  for(i in 2:5) {
+    hist(abs(X[,i] - data[,i])[is.na(masked_data[,i])], xlab = 'Absolute Deviation', main = colnames(X)[i], probability = FALSE, col = somecolors[[i]], border = somecolornames[i])
+  }
+  
+  par(mfrow = c(1,1))
+}
+
+
+absolute_deviation_distro(X.full.normreg)
+
+
+compute_MSE(X.full.normreg)
+
+```
+
+This imputation method is worse than the frequentist approach in terms of MSE. It's unexpected and it's probably due to an error or to some numerical instability due to the $\frac1x$ transform.
